@@ -6,6 +6,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from src.otel_middlware import opentelemetry_middleware
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 # Define Service Name
@@ -38,10 +39,14 @@ FastAPIInstrumentor.instrument_app(app)
 # Include all routers
 app.include_router(router)
 
+# Register middleware globally
+app.middleware("http")(opentelemetry_middleware)
+
+
 @app.get("/")
 def read_root():
     return {"message": "Hello, OpenTelemetry with Grafana!"}
 
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

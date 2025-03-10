@@ -1,14 +1,20 @@
-from opentelemetry import trace
-
-from fastapi import APIRouter, HTTPException, FastAPI
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-import sys
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
-import httpx
-from pymongo import MongoClient
-import redis
 import logging
+import sys
+
+import httpx
+from bson import ObjectId
+from fastapi import APIRouter, HTTPException, FastAPI
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from opentelemetry.trace import Status, StatusCode
+
+from src.cache import cache
+from src.database import db
 
 app = FastAPI()
 tracer = trace.get_tracer(__name__)
@@ -21,45 +27,101 @@ logger = logging.getLogger(__name__)
 
 RequestsInstrumentor().instrument()
 HTTPXClientInstrumentor().instrument()
+FastAPIInstrumentor.instrument_app(app)
 
 router = APIRouter()
 
-# MongoDB Connection
-try:
-    mongo_client = MongoClient("mongodb://loalhost:27017/")
-    db = mongo_client["mydatabase"]
-except Exception as e:
-    raise Exception(f"MongoDB Connection Error: {str(e)}")
-
-# Redis Connection
-try:
-    cache = redis.Redis(host="localhost", port=6379, decode_responses=True)
-except Exception as e:
-    raise Exception(f"Redis Connection Error: {str(e)}")
-
 
 # API-1: Fetch data from MongoDB
-@router.get("/mongo-data")
-def get_mongo_data():
-    try:
-        data = list(db["collection"].find({}, {"_id": 0}))
-        return {"mongo_data": data}
-    except Exception as e:
-        logging.error(f"Error in /mongo-data: {e}")
-        raise HTTPException(status_code=500, detail=f"MongoDB Fetch Error: {str(e)}")
+@router.get("/mongo-data/{idd}")
+async def get_mongo_data(idd: str):
+    with tracer.start_as_current_span("MongoDB Query") as span:
+        try:
+            collection = db["failed_hotel_batches"]  # Replace with your actual collection name
+
+            query = {"_id": ObjectId(idd)} if ObjectId.is_valid(idd) else {"_id": idd}
+            data = collection.find_one(query)
+
+            if data:
+                data["_id"] = str(data["_id"])  # Convert ObjectId to string
+                return {"success": True, "data": data}
+            else:
+                return {"success": False, "message": "Data not found"}
+
+        except Exception as e:
+            logging.error(f"Error in /mongo-data: {e}")
+            span.record_exception(e)  # ✅ Explicitly capture MongoDB errors
+            span.set_status(Status(StatusCode.ERROR))
+            raise HTTPException(status_code=500, detail=f"MongoDB Fetch Error: {str(e)}")
+
+
+# @router.get("/mongo-data")
+# def get_mongo_data():
+#     try:
+#         data = list(db["failed_hotel_batches"].find({}, {"_id": "e0e80557-aec6-41ed-b73f-4a0dc127d421"}))
+#         return {"mongo_data": data}
+#     except Exception as e:
+#         logging.error(f"Error in /mongo-data: {e}")
+#         raise HTTPException(status_code=500, detail=f"MongoDB Fetch Error: {str(e)}")
 
 
 # API-2: Fetch data from Cache
+# @router.get("/cache-data")
+# def get_cache_data():
+#     try:
+#         data = cache.get("HYD-STV")
+#         if data is None:
+#             raise HTTPException(status_code=404, detail="Cache key not found")
+#         return {"cache_data": data}
+#     except Exception as e:
+#         logging.error(f"Error in /cache-data: {e}")
+#         raise HTTPException(status_code=500, detail=f"Cache Fetch Error: {str(e)}")
+
+# PII Masking Function
+
+# Initialize PII Detector
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+
+
+def mask_pii(text):
+    """Detect and mask PII in text using Presidio."""
+    if not text:
+        return text
+
+    # Detect PII entities
+    results = analyzer.analyze(text=text, entities=[], language="en")
+
+    # Mask detected PII
+    anonymized_text = anonymizer.anonymize(text=text, analyzer_results=results)
+
+    return anonymized_text.text
+
+
 @router.get("/cache-data")
 def get_cache_data():
-    try:
-        data = cache.get("cached_key")
-        if data is None:
-            raise HTTPException(status_code=404, detail="Cache key not found")
-        return {"cache_data": data}
-    except Exception as e:
-        logging.error(f"Error in /cache-data: {e}")
-        raise HTTPException(status_code=500, detail=f"Cache Fetch Error: {str(e)}")
+    with tracer.start_as_current_span("Redis Query") as span:
+        try:
+            data = cache.get("Hello")
+
+            if data is None:
+                span.set_status(Status(StatusCode.ERROR))
+                span.add_event("Cache key not found")
+                raise HTTPException(status_code=404, detail="Cache key not found")
+
+            span.add_event("Cache hit")
+            masked_data = mask_pii(data)
+            span.set_attribute("response_body", masked_data)
+            return {"cache_data": data}
+
+        except Exception as e:
+            logging.error(f"Error in /cache-data: {e}")
+
+            # ✅ Capture exception in OpenTelemetry
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR))
+
+            raise HTTPException(status_code=500, detail=f"Cache Fetch Error: {str(e)}")
 
 
 # API-3: Fetch data from both MongoDB and Cache
